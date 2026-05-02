@@ -1,27 +1,20 @@
-FROM golang:1.21-alpine as base
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
 
-FROM base as builder
-# Work directory
 WORKDIR /build
 
-RUN go env -w GO111MODULE=on
-RUN go env -w GOPROXY=https://goproxy.cn,direct
-
-# Installing dependencies
 COPY go.mod go.sum /build/
-
 RUN go mod download
 
-# Copying all the files
 COPY . .
 
-# Build our application
-RUN go build -o /external-dns-huaweicloud ./cmd/webhook
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -o /external-dns-huaweicloud ./cmd/webhook
 
 FROM alpine:latest
 
-COPY --from=builder --chown=root:root external-dns-huaweicloud /bin/
+COPY --from=builder --chown=root:root /external-dns-huaweicloud /bin/
 
-# Drop to unprivileged user to run
 USER nobody
 CMD ["/bin/external-dns-huaweicloud"]
