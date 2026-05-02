@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -200,7 +199,7 @@ func getScopedTokenByIdpToken(tokenFile string, cfg *HuaweiCloudConfig) (scopedT
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to get basic auth")
 	}
-	idToken, err := ioutil.ReadFile(tokenFile)
+	idToken, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to read token file")
 	}
