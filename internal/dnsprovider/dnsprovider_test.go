@@ -181,18 +181,99 @@ func TestApplyChanges_TypeChangeFallsBackToDeleteCreate(t *testing.T) {
 		t.Errorf("expected zero UpdateRecordSets calls on type change, got %d", len(fake.updateCalls))
 	}
 	if len(fake.deleteCalls) != 1 {
-		t.Errorf("expected exactly one DeleteRecordSet call on type change, got %d", len(fake.deleteCalls))
+		t.Fatalf("expected exactly one DeleteRecordSet call on type change, got %d", len(fake.deleteCalls))
 	}
 	if len(fake.createCalls) != 1 {
-		t.Errorf("expected exactly one CreateRecordSet call on type change, got %d", len(fake.createCalls))
+		t.Fatalf("expected exactly one CreateRecordSet call on type change, got %d", len(fake.createCalls))
+	}
+
+	// Delete must target the existing A recordset, not something else.
+	if got := fake.deleteCalls[0].RecordsetId; got != "rs-1" {
+		t.Errorf("DeleteRecordSet called with RecordsetId=%q, want %q", got, "rs-1")
+	}
+	if got := fake.deleteCalls[0].ZoneId; got != "zone-1" {
+		t.Errorf("DeleteRecordSet called with ZoneId=%q, want %q", got, "zone-1")
+	}
+
+	// Create must carry the NEW type and target, not the old A record.
+	createBody := fake.createCalls[0].Body
+	if createBody == nil {
+		t.Fatal("CreateRecordSet body was nil")
+	}
+	if createBody.Type != "AAAA" {
+		t.Errorf("CreateRecordSet Type=%q, want %q", createBody.Type, "AAAA")
+	}
+	if createBody.Name != "a.example.com" {
+		t.Errorf("CreateRecordSet Name=%q, want %q", createBody.Name, "a.example.com")
+	}
+	if len(createBody.Records) != 1 || createBody.Records[0] != "::1" {
+		t.Errorf("CreateRecordSet Records=%v, want [::1]", createBody.Records)
 	}
 }
 
 func TestApplyChanges_UpdateFailureSurfacesAsSoftError(t *testing.T) {
 	fake := newFakeDNSClient()
 	fake.seedZone("zone-1", "example.com.")
+	// Recordsets:
+	//   rs-1: subject of the failing in-place update
+	//   rs-2: subject of an unrelated, explicit Delete (must run normally)
 	fake.seedRecordset("zone-1", "rs-1", "a.example.com.", "A", []string{"1.2.3.4"}, 60)
+	fake.seedRecordset("zone-1", "rs-2", "old.example.com.", "A", []string{"9.9.9.9"}, 60)
 	fake.updateErr = errors.New("simulated huawei outage")
+
+	p := newTestProvider(fake)
+
+	changes := &plan.Changes{
+		// Explicit Create/Delete in the same batch: these must succeed and be
+		// counted, so the assertions below isolate calls that came from the
+		// failing update path (which must contribute zero).
+		Create: []*endpoint.Endpoint{{
+			DNSName: "new.example.com", RecordType: "A", Targets: endpoint.Targets{"7.7.7.7"},
+		}},
+		Delete: []*endpoint.Endpoint{{
+			DNSName: "old.example.com", RecordType: "A", Targets: endpoint.Targets{"9.9.9.9"},
+		}},
+		UpdateOld: []*endpoint.Endpoint{{
+			DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"1.2.3.4"},
+		}},
+		UpdateNew: []*endpoint.Endpoint{{
+			DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"5.6.7.8"},
+		}},
+	}
+
+	err := p.ApplyChanges(context.Background(), changes)
+	if err == nil {
+		t.Fatal("expected ApplyChanges to surface update failure, got nil")
+	}
+
+	// The failing update must have been attempted exactly once.
+	if len(fake.updateCalls) != 1 {
+		t.Errorf("expected exactly one UpdateRecordSets call (the failing one), got %d", len(fake.updateCalls))
+	}
+
+	// Critical invariant: a failing in-place update must NOT silently fall back
+	// to delete+create. With explicit Delete/Create entries also in the batch,
+	// counts must equal the explicit ones — anything more would indicate a
+	// hidden fallback re-introducing the NXDOMAIN gap.
+	if len(fake.deleteCalls) != 1 {
+		t.Errorf("expected exactly one DeleteRecordSet (from explicit Delete only); got %d — update path leaked into delete", len(fake.deleteCalls))
+	} else if got := fake.deleteCalls[0].RecordsetId; got != "rs-2" {
+		t.Errorf("DeleteRecordSet hit RecordsetId=%q (expected rs-2 from explicit Delete) — update fallback may be deleting rs-1", got)
+	}
+	if len(fake.createCalls) != 1 {
+		t.Errorf("expected exactly one CreateRecordSet (from explicit Create only); got %d — update path leaked into create", len(fake.createCalls))
+	} else if got := fake.createCalls[0].Body; got == nil || got.Name != "new.example.com" {
+		t.Errorf("CreateRecordSet hit Name=%v (expected new.example.com from explicit Create) — update fallback may be re-creating a.example.com", got)
+	}
+}
+
+func TestApplyChanges_UpdateMissingRecordsetMarksZoneFailed(t *testing.T) {
+	// findRecordsetID can't locate a recordset (e.g. drift between cache and
+	// reality). updateRecords must mark the zone failed and surface a soft
+	// error, not silently no-op.
+	fake := newFakeDNSClient()
+	fake.seedZone("zone-1", "example.com.")
+	// Note: no recordset seeded for a.example.com — the lookup will miss.
 
 	p := newTestProvider(fake)
 
@@ -207,15 +288,52 @@ func TestApplyChanges_UpdateFailureSurfacesAsSoftError(t *testing.T) {
 
 	err := p.ApplyChanges(context.Background(), changes)
 	if err == nil {
-		t.Fatal("expected ApplyChanges to surface update failure, got nil")
+		t.Fatal("expected soft error when recordset lookup fails, got nil")
 	}
-	// Critical invariant: a failing in-place update must NOT silently fall back
-	// to delete+create. That would re-introduce the very gap this fix removes.
+	if len(fake.updateCalls) != 0 {
+		t.Errorf("expected zero UpdateRecordSets calls when recordset lookup fails, got %d", len(fake.updateCalls))
+	}
 	if len(fake.deleteCalls) != 0 {
-		t.Errorf("update failure must not trigger a delete fallback; got %d delete calls", len(fake.deleteCalls))
+		t.Errorf("missing recordset must not trigger delete fallback; got %d", len(fake.deleteCalls))
 	}
 	if len(fake.createCalls) != 0 {
-		t.Errorf("update failure must not trigger a create fallback; got %d create calls", len(fake.createCalls))
+		t.Errorf("missing recordset must not trigger create fallback; got %d", len(fake.createCalls))
+	}
+}
+
+func TestApplyChanges_UpdatePartialSuccess(t *testing.T) {
+	// Two same-type updates, one for a recordset that exists and one that
+	// doesn't. The found one must update; the missing one must surface as
+	// failure. updateRecords must continue past the failure rather than
+	// short-circuit on the first miss.
+	fake := newFakeDNSClient()
+	fake.seedZone("zone-1", "example.com.")
+	fake.seedRecordset("zone-1", "rs-1", "a.example.com.", "A", []string{"1.2.3.4"}, 60)
+	// No recordset for b.example.com — that one will fail.
+
+	p := newTestProvider(fake)
+
+	changes := &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{
+			{DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"1.2.3.4"}},
+			{DNSName: "b.example.com", RecordType: "A", Targets: endpoint.Targets{"2.2.2.2"}},
+		},
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"5.6.7.8"}},
+			{DNSName: "b.example.com", RecordType: "A", Targets: endpoint.Targets{"3.3.3.3"}},
+		},
+	}
+
+	err := p.ApplyChanges(context.Background(), changes)
+	if err == nil {
+		t.Fatal("expected soft error when one of the updates fails, got nil")
+	}
+
+	// The healthy one must still go through.
+	if len(fake.updateCalls) != 1 {
+		t.Errorf("expected exactly one UpdateRecordSets call (the resolvable one), got %d", len(fake.updateCalls))
+	} else if got := fake.updateCalls[0].RecordsetId; got != "rs-1" {
+		t.Errorf("UpdateRecordSets hit RecordsetId=%q, want %q", got, "rs-1")
 	}
 }
 
