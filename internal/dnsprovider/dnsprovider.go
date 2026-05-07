@@ -506,14 +506,24 @@ func (p *HuaweicloudProvider) ApplyChanges(ctx context.Context, changes *plan.Ch
 		}
 	}
 
-	deleteChanges := append(changes.Delete, changes.UpdateOld...)
+	// Same-type UpdateOld/UpdateNew pairs go through an atomic in-place update
+	// (no DNS resolution gap). Type-change pairs are unavoidably routed
+	// through delete+create because Huawei's UpdateRecordSets cannot change
+	// the record type.
+	inPlaceUpdates, fallbackOld, fallbackNew := partitionUpdates(changes.UpdateOld, changes.UpdateNew)
+
+	deleteChanges := append([]*endpoint.Endpoint{}, changes.Delete...)
+	deleteChanges = append(deleteChanges, fallbackOld...)
 	deleteEndpoints := p.getDeleteRecordIdsMap(zoneNameIDMapper, deleteChanges, zoneRecordsGroup)
 	var failedZones []string
 	failedDeleteZones := p.deleteRecords(deleteEndpoints)
 	failedZones = append(failedZones, failedDeleteZones...)
 
+	failedUpdateZones := p.updateRecords(zoneNameIDMapper, inPlaceUpdates, zoneRecordsGroup)
+
 	createEndpoints := make(map[string][]*endpoint.Endpoint)
-	createChanges := append(changes.Create, changes.UpdateNew...)
+	createChanges := append([]*endpoint.Endpoint{}, changes.Create...)
+	createChanges = append(createChanges, fallbackNew...)
 	for _, createChange := range createChanges {
 		zoneId, _ := zoneNameIDMapper.FindZone(cleanDomainName(createChange.DNSName))
 		if zoneId != "" {
@@ -526,9 +536,16 @@ func (p *HuaweicloudProvider) ApplyChanges(ctx context.Context, changes *plan.Ch
 		}
 	}
 	failedCreateZones := p.createRecords(createEndpoints)
+
 	set := make(map[string]struct{})
 	for _, zone := range failedZones {
 		set[zone] = struct{}{}
+	}
+	for _, zone := range failedUpdateZones {
+		if _, exist := set[zone]; !exist {
+			failedZones = append(failedZones, zone)
+			set[zone] = struct{}{}
+		}
 	}
 	for _, zone := range failedCreateZones {
 		if _, exist := set[zone]; !exist {
@@ -629,6 +646,111 @@ func (p *HuaweicloudProvider) deleteRecordsByZoneId(zoneId string, recordIds []s
 		}
 	}
 	return nil
+}
+
+// partitionUpdates splits parallel UpdateOld/UpdateNew slices into in-place
+// updates (RecordType matches) and pairs that must fall back to delete+create.
+// external-dns aligns the slices by index; we cross-check DNSName so that any
+// contract violation is routed through the safe fallback rather than risking a
+// wrong in-place update.
+func partitionUpdates(updateOld, updateNew []*endpoint.Endpoint) (
+	inPlace, fallbackOld, fallbackNew []*endpoint.Endpoint,
+) {
+	if len(updateOld) != len(updateNew) {
+		log.Warnf("UpdateOld/UpdateNew length mismatch (%d vs %d); routing all through delete+create",
+			len(updateOld), len(updateNew))
+		return nil, updateOld, updateNew
+	}
+	for i := range updateOld {
+		old, neu := updateOld[i], updateNew[i]
+		if cleanDomainName(old.DNSName) != cleanDomainName(neu.DNSName) {
+			log.Warnf("UpdateOld/UpdateNew name mismatch at index %d (%q vs %q); falling back to delete+create",
+				i, old.DNSName, neu.DNSName)
+			fallbackOld = append(fallbackOld, old)
+			fallbackNew = append(fallbackNew, neu)
+			continue
+		}
+		if old.RecordType != neu.RecordType {
+			// Huawei's UpdateRecordSets cannot change the type of an existing
+			// recordset, so type changes can only be expressed as delete+create.
+			fallbackOld = append(fallbackOld, old)
+			fallbackNew = append(fallbackNew, neu)
+			continue
+		}
+		inPlace = append(inPlace, neu)
+	}
+	return
+}
+
+func findRecordsetID(zoneRecordsGroup map[string]RecordListGroup, zoneID, name, recordType string) (string, bool) {
+	group, ok := zoneRecordsGroup[zoneID]
+	if !ok {
+		return "", false
+	}
+	cleanName := cleanDomainName(name)
+	for _, r := range group.records {
+		if cleanDomainName(*r.Name) == cleanName && *r.Type == recordType {
+			return *r.Id, true
+		}
+	}
+	return "", false
+}
+
+// updateRecords issues an atomic UpdateRecordSets call per endpoint, swapping
+// targets/TTL in place. This is the path that closes the NXDOMAIN gap that the
+// previous delete+create flow exposed during reconciles.
+func (p *HuaweicloudProvider) updateRecords(
+	zoneNameIDMapper provider.ZoneIDName,
+	updates []*endpoint.Endpoint,
+	zoneRecordsGroup map[string]RecordListGroup,
+) []string {
+	failed := make(map[string]struct{})
+	for _, ep := range updates {
+		zoneID, _ := zoneNameIDMapper.FindZone(cleanDomainName(ep.DNSName))
+		if zoneID == "" {
+			log.Infof("Missing domain name for updating %v record %v", ep.RecordType, ep.DNSName)
+			continue
+		}
+		recordsetID, ok := findRecordsetID(zoneRecordsGroup, zoneID, ep.DNSName, ep.RecordType)
+		if !ok {
+			log.Errorf("No existing recordset for %s/%s in zone %s; cannot update in place",
+				ep.RecordType, ep.DNSName, zoneID)
+			failed[zoneID] = struct{}{}
+			continue
+		}
+		if p.dryRun {
+			log.Infof("Dry run: Update %s record named '%s' to '%s' with ttl %d for Huawei Cloud DNS",
+				ep.RecordType, ep.DNSName, ep.Targets, ep.RecordTTL)
+			continue
+		}
+		records := []string(ep.Targets)
+		req := &dnsMdl.UpdateRecordSetsRequest{
+			ZoneId:      zoneID,
+			RecordsetId: recordsetID,
+			Body: &dnsMdl.UpdateRecordSetsReq{
+				Name:    ep.DNSName,
+				Type:    ep.RecordType,
+				Records: &records,
+			},
+		}
+		if ep.RecordTTL.IsConfigured() {
+			ttl := int32(ep.RecordTTL)
+			req.Body.Ttl = &ttl
+		}
+		resp, err := p.dnsClient.UpdateRecordSets(req)
+		if err != nil {
+			log.Error(errors.Wrapf(err, "failed to update record %s for Huawei Cloud DNS", ep.DNSName))
+			failed[zoneID] = struct{}{}
+			continue
+		}
+		log.Infof("Update %s record named '%s' to '%s' with ttl %d for Huawei Cloud DNS: Record ID=%s",
+			ep.RecordType, ep.DNSName, ep.Targets.String(), ep.RecordTTL, *resp.Id)
+	}
+	failedZones := make([]string, 0, len(failed))
+	for z := range failed {
+		failedZones = append(failedZones, z)
+	}
+	return failedZones
 }
 
 func int32Ptr(v int32) *int32 {

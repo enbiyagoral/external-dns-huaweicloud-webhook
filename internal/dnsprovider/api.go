@@ -22,6 +22,7 @@ import "github.com/huaweicloud/huaweicloud-sdk-go-v3/services/dns/v2/model"
 type HuaweiCloudDNSAPI interface {
 	CreateRecordSet(request *model.CreateRecordSetRequest) (*model.CreateRecordSetResponse, error)
 	DeleteRecordSet(request *model.DeleteRecordSetRequest) (*model.DeleteRecordSetResponse, error)
+	UpdateRecordSets(request *model.UpdateRecordSetsRequest) (*model.UpdateRecordSetsResponse, error)
 	ListRecordSetsByZone(request *model.ListRecordSetsByZoneRequest) (*model.ListRecordSetsByZoneResponse, error)
 	ShowPrivateZone(request *model.ShowPrivateZoneRequest) (*model.ShowPrivateZoneResponse, error)
 	ListPrivateZones(request *model.ListPrivateZonesRequest) (*model.ListPrivateZonesResponse, error)

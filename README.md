@@ -47,6 +47,17 @@ data:
 >
 > When using an internal domain name, you can specify the same name domain through `vpcId`.
 
+#### Required DNS permissions
+
+The webhook performs record updates atomically via Huawei's `UpdateRecordSets`
+API (no NXDOMAIN gap during reconciles). The IAM credential therefore needs:
+
+- read access to zones and recordsets (e.g. `dns:zone:list`, `dns:zone:get`, `dns:recordset:list`),
+- `dns:recordset:create` and `dns:recordset:update` for normal reconciles,
+- `dns:recordset:delete` only when running external-dns with `--policy=sync`.
+  Under `--policy=upsert-only` (the recommended default for this webhook) the
+  delete permission can be omitted entirely.
+
 ### Step 2: Deploy External-DNS-Webhook
 
 ```yaml
